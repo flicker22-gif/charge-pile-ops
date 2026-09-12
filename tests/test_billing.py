@@ -85,6 +85,53 @@ class TestSettle(unittest.TestCase):
         self.assertTrue(r2["duplicated"])
         self.assertEqual(r2["bill"]["bill_id"], b1["bill_id"])
 
+    def test_sample_after_end_ts_excluded(self):
+        """结束后才产生的样本（即使先到）不影响账单。"""
+        t0 = ts("2026-09-10 22:30")
+        sid = self.client.post("/api/piles/P1/event", json={
+            "type": "plug_in", "ts": t0, "meter_kwh": 1000.0}).get_json()["session"]["session_id"]
+        self.client.post("/api/piles/P1/scan", json={"ts": t0})
+        samples = [
+            {"seq": i + 1, "ts": t0 + (i + 1) * 1800, "kwh": 1000.0 + (i + 1) * 30.0}
+            for i in range(18)
+        ]
+        # 结束后才产生的样本（07:35、07:40）混在批里一起上报
+        end = t0 + 9 * 3600
+        late = [
+            {"seq": 19, "ts": end + 300, "kwh": 1545.0},
+            {"seq": 20, "ts": end + 600, "kwh": 1550.0},
+        ]
+        self.client.post("/api/piles/P1/meter",
+                         json={"session_id": sid, "samples": samples + late})
+        self.client.post(f"/api/sessions/{sid}/stop", json={"ts": end})
+        bill = self.client.post(f"/api/sessions/{sid}/settle").get_json()["bill"]
+        self.assertEqual(bill["total_kwh"], 540.0)          # 不是 550
+        self.assertAlmostEqual(float(bill["total_amount"]), 456.00)
+        sess = self.client.get(f"/api/sessions/{sid}").get_json()["session"]
+        self.assertEqual(sess["end_meter"], 1540.0)         # 定格在窗口内末次表码
+
+    def test_late_backfill_before_end_ts_counted(self):
+        """结束前产生、结束后才晚到的补报仍计入账单。"""
+        t0 = ts("2026-09-10 22:30")
+        sid = self.client.post("/api/piles/P1/event", json={
+            "type": "plug_in", "ts": t0, "meter_kwh": 1000.0}).get_json()["session"]["session_id"]
+        self.client.post("/api/piles/P1/scan", json={"ts": t0})
+        samples = [
+            {"seq": i + 1, "ts": t0 + (i + 1) * 1800, "kwh": 1000.0 + (i + 1) * 30.0}
+            for i in range(18)
+        ]
+        held = samples[-1]            # 07:30 的最后一条先扣住，模拟断线晚到
+        self.client.post("/api/piles/P1/meter",
+                         json={"session_id": sid, "samples": samples[:-1]})
+        end = t0 + 9 * 3600
+        self.client.post(f"/api/sessions/{sid}/stop", json={"ts": end})
+        # 结束后补报才到：ts 在窗口内，必须算进去
+        self.client.post("/api/piles/P1/meter", json={"session_id": sid, "samples": [held]})
+        bill = self.client.post(f"/api/sessions/{sid}/settle").get_json()["bill"]
+        self.assertEqual(bill["total_kwh"], 540.0)          # 不是 510
+        sess = self.client.get(f"/api/sessions/{sid}").get_json()["session"]
+        self.assertEqual(sess["end_meter"], 1540.0)         # 结算时按补报重新定格
+
     def test_scan_and_plug_in_idempotent(self):
         t0 = ts("2026-09-10 22:30")
         r1 = self.client.post("/api/piles/P1/event", json={

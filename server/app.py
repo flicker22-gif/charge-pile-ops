@@ -228,8 +228,8 @@ def stop(sid):
         conn.close()
         return err(f"当前状态 {sess['state']} 不能结束", 409)
     last = conn.execute(
-        "SELECT kwh FROM meter_samples WHERE session_id=? ORDER BY ts DESC, seq DESC LIMIT 1", (sid,)
-    ).fetchone()
+        "SELECT kwh FROM meter_samples WHERE session_id=? AND ts<=?"
+        " ORDER BY ts DESC, seq DESC LIMIT 1", (sid, ts)).fetchone()
     end_meter = last["kwh"] if last else sess["start_meter"]
     conn.execute("UPDATE sessions SET state='FINISHED', end_ts=?, end_meter=? WHERE session_id=?",
                  (ts, end_meter, sid))
@@ -240,7 +240,14 @@ def stop(sid):
 
 
 def compute_bill(sess, samples):
-    """按表码样本把电量切到各费率时段：每段样本区间的电量按时间占比分摊。"""
+    """按表码样本把电量切到各费率时段：每段样本区间的电量按时间占比分摊。
+
+    只计入 ts <= end_ts 的样本：结束前产生、只是晚到的补报照常算；
+    结束之后才产生的样本不影响本次结算。
+    """
+    end_ts = sess["end_ts"]
+    if end_ts is not None:
+        samples = [s for s in samples if s["ts"] <= end_ts]
     points = [(sess["start_ts"], sess["start_meter"])] + [(s["ts"], s["kwh"]) for s in samples]
     points.sort(key=lambda p: p[0])
     kwh_by_label = {}
@@ -271,7 +278,7 @@ def compute_bill(sess, samples):
             "subtotal": str(energy_fee + service_fee),
         })
         total += energy_fee + service_fee
-    return round(total_kwh, 3), str(total), items
+    return round(total_kwh, 3), str(total), items, points[-1][1]
 
 
 @app.post("/api/sessions/<sid>/settle")
@@ -295,7 +302,9 @@ def settle(sid):
 
     samples = [row_dict(r) for r in conn.execute(
         "SELECT seq, ts, kwh FROM meter_samples WHERE session_id=? ORDER BY ts, seq", (sid,))]
-    total_kwh, total_amount, items = compute_bill(sess, samples)
+    total_kwh, total_amount, items, final_meter = compute_bill(sess, samples)
+    # 晚到的窗口内补报可能把末次表码推高，结算时按窗口内样本重新定格
+    conn.execute("UPDATE sessions SET end_meter=? WHERE session_id=?", (final_meter, sid))
     bill_id = "B" + uuid.uuid4().hex[:12]
     try:
         conn.execute(

@@ -106,6 +106,11 @@ def main():
         pile.plug_out(t.timestamp())
         log("已拔枪")
 
+        log("\n=== 结束后又晚到一条表码（07:35，+5 kWh，模拟断线桩的滞后报文）===")
+        pile.charge(STEP_KWH)
+        pile.report_meter((t + timedelta(minutes=STEP_MIN)).timestamp())
+        log("该样本产生于结束时间之后 -> 结算时将被排除，不会计入本单")
+
         log("\n=== 结算 ===")
         bill = post(f"/api/sessions/{sid}/settle")["bill"]
         log(f"账单 {bill['bill_id']}  总电量 {bill['total_kwh']} kWh  总金额 ¥{bill['total_amount']}")
@@ -116,7 +121,8 @@ def main():
             log(f"│ {it['period']}     │ {it['kwh']:>10.1f} │ {it['energy_fee']:>8} │ "
                 f"{it['service_fee']:>8} │ {it['subtotal']:>8} │")
         log("└────────┴────────────┴──────────┴──────────┴──────────┘")
-        log("（谷 0.35+0.45 元/kWh，平 0.75+0.45 元/kWh —— 跨时段按实际占比分开计）")
+        log("（谷 0.35+0.45 元/kWh，平 0.75+0.45 元/kWh —— 跨时段按实际占比分开计；")
+        log("  结束后晚到的 5 kWh 未计入，总电量仍为 540 kWh）")
 
         log("\n=== 重复结算测试（同一会话再结算一次）===")
         r2 = post(f"/api/sessions/{sid}/settle")
