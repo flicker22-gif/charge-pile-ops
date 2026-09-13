@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 import uuid
+from collections import deque
 from decimal import Decimal, ROUND_HALF_UP
 
 from flask import Flask, jsonify, request
@@ -17,7 +18,15 @@ from flask import Flask, jsonify, request
 from tariff import (PERIODS, SERVICE_FEE, period_at, price_in, split_by_timeline,
                     validate_periods, version_at)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charge_ops.db")
+# 可用 CHARGE_OPS_DB 指定数据库文件（测试/演示用临时库时不污染默认 charge_ops.db）
+DB_PATH = os.environ.get(
+    "CHARGE_OPS_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "charge_ops.db"))
+
+# 故障注入：POST /api/debug/meter_failures 后，接下来的若干次 /meter 直接返回
+# 指定错误码且不处理任何样本（模拟服务端 4xx/5xx，桩必须把样本留档重发）。
+# 仅用于演示/测试，进程内存态、不落库、不参与正常计费。
+_meter_failures = deque()
 
 # 会话状态机：
 # PLUGGED(插枪) -> CHARGING(充电中) -> FINISHED(结束) -> SETTLED(已结算) -> CLOSED(拔枪离场)
@@ -429,6 +438,10 @@ def meter_report(pile_id):
     响应里带余额监管指令：warning 预警 / cmd 断电指令，桩侧须执行并提示车主。
     """
     body = request.get_json(force=True)
+    # 故障注入：命中时直接失败，不读会话、不落任何样本，桩侧应留档重发
+    if _meter_failures:
+        code = _meter_failures.popleft()
+        return err(f"注入故障：模拟服务端 {code}，样本未处理，请重发", code)
     sid = body.get("session_id")
     samples = body.get("samples") or []
     conn = db()
@@ -527,6 +540,28 @@ def heartbeat(pile_id):
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
+
+
+# ---------------- 故障注入（仅演示/测试） ----------------
+
+@app.post("/api/debug/meter_failures")
+def inject_meter_failures():
+    """安排接下来若干次 /meter 直接返回错误码且不处理样本。
+
+    body: {"codes": [400, 503]} 或 {"code": 503, "times": 2}。
+    用来稳定演示/测试：服务端报错时桩样本必须留档，恢复后重发不丢、不重复计。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    codes = body.get("codes")
+    if codes is None:
+        code = int(body.get("code", 503))
+        codes = [code] * int(body.get("times", 1))
+    codes = [int(c) for c in codes]
+    if any(not (400 <= c <= 599) for c in codes):
+        return err("错误码必须在 400-599 之间")
+
+    _meter_failures.extend(codes)
+    return jsonify({"ok": True, "queued": list(_meter_failures)})
 
 
 # ---------------- 充电流程 ----------------

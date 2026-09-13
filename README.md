@@ -8,13 +8,15 @@
 
 ```
 server/
-  app.py       # Flask + SQLite 后端：桩接入、充电流程、计费、余额监管、占位费、结算
+  app.py       # Flask + SQLite 后端：桩接入、充电流程、计费、余额监管、占位费、结算、故障注入
   tariff.py    # 峰谷平费率表 + 跨时段拆分（运营方直接改 PERIODS / SERVICE_FEE）
 simulator/
-  pile_sim.py  # 充电桩模拟器：状态/表码上报，断线缓存、恢复补报，执行断电指令
-demo.py        # 端到端演示：预付费充电 → 余额断电 → 占位费 → 拔枪出账
+  pile_sim.py  # 充电桩模拟器：状态/表码上报，样本先落盘、失败留档、重启恢复按序补报，执行断电
+  .pile_state/ # 桩本地状态文件（<pile_id>.json：表码/seq/会话/未确认队列/死信档），运行时生成
+demo.py        # 端到端演示：失败报错 -> 桩进程重启 -> 本地恢复补报 -> 去重 -> 余额断电 -> 结算
 tests/
-  test_billing.py  # 拆分、补报去重、结算幂等、余额断电、占位费的单元测试
+  test_billing.py    # 拆分、补报去重、结算幂等、余额断电、占位费的单元测试
+  test_recovery.py   # 落盘补发、4xx/5xx 重试、重启恢复、端到端"失败→重启→恢复→结算"
 ```
 
 ## 运行
@@ -25,7 +27,8 @@ python3 server/app.py --port 5000        # 单独起服务端
 python3 -m unittest discover -s tests    # 跑测试
 ```
 
-只依赖 Flask，其余全部标准库。
+只依赖 Flask，其余全部标准库。演示和测试用临时库（`CHARGE_OPS_DB`）与临时桩状态
+目录，不污染默认的 `server/charge_ops.db`。
 
 ## 关键设计
 
@@ -51,8 +54,17 @@ python3 -m unittest discover -s tests    # 跑测试
 `POST /api/config` 随时改。已结算未拔枪时 `GET /api/sessions/<id>` 返回
 `occupancy_running`，车主端能看到占位费实时在跑。
 
-**掉线不丢电**：表码是单调递增的累计值。桩断线时样本缓存在本地（`Pile.buffer`），
-恢复后批量补报；即使中间报文全丢，末次表码减起始底数仍是全部电量。
+**掉线不丢电（本地持久化补发链）**：表码是单调递增的累计值。桩侧每条样本
+**先落盘再发送**——本地状态文件 `simulator/.pile_state/<pile_id>.json`（原子替换写）
+记录当前表码、seq、会话号、未确认样本队列 outbox 和永久拒收的死信档 dead_letter。
+- 连不上、超时、服务端回 4xx/5xx：整批样本留在盘上，之后（或下次上报时）按
+  seq 原序重发；
+- 桩进程被杀/掉电重启：用同一 pile_id 重建 `Pile` 即从状态文件恢复表码、seq、
+  会话和队列，恢复后严格按原顺序补报；
+- 服务端 200 响应逐条核销：`accepted`/`late` 出队，`duplicate` 是已收过的重发
+  （典型场景：上一次其实成功、只是响应回程丢失），同样出队；`rejected` 是会话
+  非法等永久错误，转死信档留盘，不堵住后面的样本；
+- 即使中间报文全丢，末次表码减起始底数仍是全部电量；重发永远不会多算电。
 
 **上报逐条分类 + 会话校验**：`/meter` 响应里 `results` 对每条样本给出状态——
 `accepted`（有效计入）/ `duplicate`（重复，已去重）/ `late`（晚于结束时间，
@@ -87,6 +99,7 @@ FINISHED 状态下 `ts <= end_ts` 的晚到补报照常接受，补报通道不�
 | POST | `/api/sessions/<id>/settle` | 结算出账单（幂等），开始占位计时 |
 | GET  | `/api/sessions/<id>` | 会话 + 账单 + 实时占位费 |
 | GET  | `/api/piles` · `/api/tariff` | 桩列表 · 费率表 |
+| POST | `/api/debug/meter_failures` | 故障注入（仅演示/测试）：接下来若干次 `/meter` 返回 4xx/5xx 且不落样本，`{codes:[400,503]}` |
 
 ## 后续可扩展
 

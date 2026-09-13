@@ -1,16 +1,21 @@
 """端到端演示：预付费充电，余额不足自动断电，占位费并入账单。
 
-场景：车主余额 ¥100，9月10日 22:30（平时）插枪扫码，23:00 进入谷时，60kW 充电。
-中途 23:40-23:50 桩断线（样本缓存补报）；费用逼近余额时先预警，
-余额不够下一间隔时服务端下令断电，按实际充电量结算。
-结算后车主没拔枪，占位费开始计时（宽限 10 分钟，超时 1 元/分钟，可配），
-车主看到费用在跑，充值后拔枪，占位费并入同一张账单。
+场景：车主余额 ¥100，9月10日 22:30（平时）插枪采样，23:00 进入谷时，60kW 充电。
+中途 23:40-23:50 桩断线（样本缓存补报）；23:55 起服务端连续两次表码上报报错
+（400、503），样本全部留在桩本地落盘；00:05 桩进程意外重启，新进程从本地状态
+文件恢复表码/seq/会话号和未确认队列，按 seq 原序补报，服务端逐条确认、重发按
+duplicate 去重，电量一笔不丢也不重复计；费用逼近余额时先预警，余额不够下一间隔
+时服务端下令断电，按实际充电量结算。结算后一条跨结束时间的样本按规则只存档不进
+账，占位费从结算点起算，车主充值后拔枪，占位费并入同一张账单。
 
 运行：python3 demo.py
 """
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -29,6 +34,8 @@ STEP_MIN = 5                      # 每步模拟 5 分钟
 STEP_KWH = POWER_KW * STEP_MIN / 60
 REAL_SLEEP = 0.08                 # 每步真实等待，便于观看
 OWNER = "U1001"
+# 桩本地状态目录（样本先落盘的位置）；演示用临时目录，每次跑完自动清掉
+STATE_DIR = Path(tempfile.mkdtemp(prefix="pile_state_demo_"))
 
 
 def api(path):
@@ -49,9 +56,12 @@ def log(msg):
 
 
 def main():
+    db_fd, db_path = tempfile.mkstemp(prefix="charge_ops_demo_", suffix=".db")
+    os.close(db_fd)
+    server_env = dict(os.environ, CHARGE_OPS_DB=db_path)
     server = subprocess.Popen(
         [sys.executable, str(ROOT / "server" / "app.py"), "--port", str(PORT)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=server_env)
     try:
         for _ in range(50):
             try:
@@ -82,7 +92,7 @@ def main():
         r = post(f"/api/owners/{OWNER}/recharge", {"amount": "100.00"})
         log(f"账户余额 ¥{r['balance']}")
 
-        pile = Pile(SERVER, "CP001", "1号桩")
+        pile = Pile(SERVER, "CP001", "1号桩", state_dir=str(STATE_DIR))
         pile.register()
         post("/api/piles/register", {"pile_id": "CP001", "name": "1号桩", "station_id": "ST01"})
         t = datetime(2026, 9, 10, 22, 30)   # 虚拟时钟：平时段插枪，23:00 起进入谷时
@@ -101,10 +111,19 @@ def main():
         offline_from = datetime(2026, 9, 10, 23, 40)
         offline_to = datetime(2026, 9, 10, 23, 50)
         price_change_at = datetime(2026, 9, 10, 23, 30)
+        fail_points = {datetime(2026, 9, 10, 23, 55), datetime(2026, 9, 11, 0, 0)}
+        restart_at = datetime(2026, 9, 11, 0, 5)
         log(f"\n=== 充电中，{POWER_KW:.0f}kW，每 {STEP_MIN} 分钟上报一次表码 ===")
         cmd = None
+        recovered_samples = []
         while t < end_t:
             t += timedelta(minutes=STEP_MIN)
+            if t == restart_at:
+                # 模拟桩进程被杀/断电后重启：新进程从本地状态文件恢复（不向服务端要任何数据）
+                log(f"  {t:%H:%M}  💥 桩进程意外退出后重启：丢弃内存，只从本地状态文件恢复")
+                pile = Pile(SERVER, "CP001", "1号桩", state_dir=str(STATE_DIR))
+                log(f"         恢复表码 {pile.meter_kwh:.1f} kWh、seq={pile.seq}、"
+                    f"会话 {pile.session_id}，未确认样本 {pile.pending} 条仍在盘上")
             pile.charge(STEP_KWH)
             if t == price_change_at:
                 new_periods = [[s, e, l, (0.50 if l == "谷" else p)] for s, e, l, p in st01_periods]
@@ -119,15 +138,28 @@ def main():
             resp = pile.report_meter(t.timestamp())
             if t == offline_to:
                 resp = pile.reconnect()
+                # 从下一批表码开始制造两次服务端故障（400、503），样本一条都不能丢
+                post("/api/debug/meter_failures", {"codes": [400, 503]})
                 s = resp["summary"]
                 log(f"  {t:%H:%M}  ✓ 网络恢复，缓存样本批量补报 -> "
                     f"接受 {s['accepted']} 条，重复 {s['duplicate']} 条，晚于结束 {s['late']} 条")
+            if t in fail_points and resp is None:
+                code = getattr(pile.last_error, "code", "断连")
+                log(f"  {t:%H:%M}  ❌ 服务端返回 {code}，本批没拿到确认 -> "
+                    f"样本已在本地落盘，补发队列 {pile.pending} 条，恢复后按 seq 原序重发")
+            if t == restart_at:
+                s = resp["summary"]
+                recovered_samples = list(pile.last_sent)   # 补报批用于稍后演示重传
+                log(f"  {t:%H:%M}  ♻ 重启后自动补报 -> "
+                    f"接受 {s['accepted']} 条，重复 {s['duplicate']} 条，晚于结束 {s['late']} 条，"
+                    f"seq {[x['seq'] for x in recovered_samples]} 按原顺序到达，"
+                    f"本地未确认队列剩余 {pile.pending} 条")
             if resp and resp.get("warning"):
                 log(f"  {t:%H:%M}  ⚠ 服务端预警 -> {resp['warning']}")
             if t.strftime("%H:%M") in ("23:00", "07:00"):
                 log(f"  {t:%H:%M}  ⏱ 跨越费率时段边界，电量将按前后时段分别计")
             if t.minute == 0 and not resp:
-                log(f"  {t:%m-%d %H:%M}  表码 {pile.meter_kwh:8.1f} kWh（离线缓存中）")
+                log(f"  {t:%m-%d %H:%M}  表码 {pile.meter_kwh:8.1f} kWh（离线/失败，样本本地留存中）")
             elif t.minute == 0:
                 log(f"  {t:%m-%d %H:%M}  表码 {pile.meter_kwh:8.1f} kWh")
             if resp and resp.get("cmd"):
@@ -136,11 +168,13 @@ def main():
                 break
             time.sleep(REAL_SLEEP)
 
-        log("\n=== 模拟网络重传：最近一批样本原样重发 ===")
-        r = pile.resend_last()
+        log("\n=== 模拟网络重传：把重启后补报过的那批样本原样再发一遍 ===")
+        r = post(f"/api/piles/{pile.pile_id}/meter",
+                 {"session_id": sid, "samples": recovered_samples})
         s = r["summary"]
         log(f"服务端分类：接受 {s['accepted']}，重复 {s['duplicate']}，晚于结束 {s['late']}"
-            f"（seq {r['results'][0]['seq']} -> {r['results'][0]['status']}，重发不重复计）")
+            f"（seq {r['results'][0]['seq']} -> {r['results'][0]['status']}，"
+            f"服务端早收过，重发不重复计电）")
 
         log(f"\n=== {t:%m-%d %H:%M} 充电结束（原因：{cmd['reason'] if cmd else 'user'}）===")
         r = post(f"/api/sessions/{sid}/stop",
@@ -239,6 +273,13 @@ def main():
         log(f"  GET {SERVER}/api/sessions/{sid}  会话与账单")
     finally:
         server.terminate()
+        server.wait(timeout=5)
+        shutil.rmtree(STATE_DIR, ignore_errors=True)   # 清桩本地状态目录
+        for suffix in ("", "-wal", "-shm"):           # 清临时数据库
+            try:
+                os.unlink(db_path + suffix)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
