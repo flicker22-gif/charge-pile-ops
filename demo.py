@@ -153,6 +153,13 @@ def main():
         r0 = resp["results"][0]
         log(f"服务端分类：{r0['status']} -> {r0['reason']}")
 
+        log("\n=== 窗口内的晚到补报仍被接受（结束时间之前产生，只是晚到）===")
+        resp = post(f"/api/piles/{pile.pile_id}/meter", {"session_id": sid, "samples": [
+            {"seq": 90, "ts": (t - timedelta(minutes=STEP_MIN)).timestamp(),
+             "kwh": pile.meter_kwh - 2 * STEP_KWH}]})
+        r0 = resp["results"][0]
+        log(f"服务端分类：{r0['status']}（补报通道不受校验影响）")
+
         log("\n=== 结算（按实际充电量，从余额扣款）===")
         r = post(f"/api/sessions/{sid}/settle", {"ts": t.timestamp()})
         bill = r["bill"]
@@ -181,6 +188,21 @@ def main():
         same = r2["duplicated"] and r2["bill"]["bill_id"] == bill["bill_id"]
         log(f"返回账单 {r2['bill']['bill_id']}  duplicated={r2['duplicated']}  -> "
             + ("同一张账单，未重复出账 ✓" if same else "❌ 出现异常"))
+
+        log("\n=== 安全校验：冒用/过期会话号的上报被拒收 ===")
+        post("/api/piles/register", {"pile_id": "CP002", "name": "2号桩", "station_id": "ST01"})
+        fake = [{"seq": 999, "ts": t.timestamp(), "kwh": 9999.0}]
+        r = post("/api/piles/CP002/meter", {"session_id": sid, "samples": fake})
+        log(f"  2号桩冒用本会话号上报   -> {r['results'][0]['status']}: {r['results'][0]['reason']}")
+        r = post(f"/api/piles/{pile.pile_id}/meter", {"session_id": "S伪造会话", "samples": fake})
+        log(f"  编造不存在的会话号上报  -> {r['results'][0]['status']}: {r['results'][0]['reason']}")
+        r = post(f"/api/piles/{pile.pile_id}/meter", {"session_id": sid, "samples": [
+            {"seq": 91, "ts": (t - timedelta(minutes=3)).timestamp(), "kwh": 1098.0}]})
+        log(f"  已结算会话再收到新样本  -> {r['results'][0]['status']}: {r['results'][0]['reason']}")
+        r = post(f"/api/piles/{pile.pile_id}/meter", {"session_id": sid, "samples": [
+            {"seq": 90, "ts": (t - timedelta(minutes=STEP_MIN)).timestamp(),
+             "kwh": pile.meter_kwh - 2 * STEP_KWH}]})
+        log(f"  已结算后重发老样本      -> {r['results'][0]['status']}（幂等去重，不误拒）")
 
         log("\n=== 车主充完没拔枪，占位计时开始 ===")
         t8 = (t + timedelta(minutes=8)).timestamp()

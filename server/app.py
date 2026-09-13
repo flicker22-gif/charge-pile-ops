@@ -424,6 +424,8 @@ def meter_report(pile_id):
 
     kwh 是电表累计读数。桩断线时本地缓存、恢复后批量补报；
     UNIQUE(session_id, seq) 保证补报/重发不会重复计入。
+    每条样本先验会话（存在、属于本桩、状态作数）再入库，拒收的不落库；
+    但 FINISHED 状态下 ts <= end_ts 的晚到补报照常接受。
     响应里带余额监管指令：warning 预警 / cmd 断电指令，桩侧须执行并提示车主。
     """
     body = request.get_json(force=True)
@@ -432,30 +434,53 @@ def meter_report(pile_id):
     conn = db()
     conn.execute("UPDATE piles SET last_seen=?, status='online' WHERE pile_id=?", (now(), pile_id))
     sess = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
-    end_ts = sess["end_ts"] if sess else None
 
-    # 逐条分类：accepted 有效计入 / duplicate 重复去重 / late 晚于结束时间（只存档不计费）
+    def classify(ts_val):
+        """会话校验：不属于本桩 / 不存在 / 已关闭的一律拒收。"""
+        if sess is None:
+            return "rejected", "会话不存在"
+        if sess["pile_id"] != pile_id:
+            return "rejected", "会话不属于本桩"
+        state = sess["state"]
+        if state in ("SETTLED", "CLOSED", "CANCELLED"):
+            return "rejected", f"会话已终结（{state}），不再接受表码"
+        if state == "PLUGGED":
+            return "rejected", "会话未开始充电"
+        if state == "CHARGING":
+            if ts_val < sess["start_ts"]:
+                return "rejected", "样本时间早于充电开始"
+            return "accepted", None
+        # FINISHED：结束前产生、只是晚到的补报仍接受；结束后才产生的只存档不计费
+        if ts_val <= sess["end_ts"]:
+            return "accepted", None
+        return "late", "晚于结束时间，不计入本次账单"
+
+    # 逐条分类：accepted 有效计入 / duplicate 重复去重 / late 只存档不计费 / rejected 拒收
     results = []
     for s in samples:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO meter_samples(session_id, seq, ts, kwh) VALUES(?,?,?,?)",
-            (sid, int(s["seq"]), float(s["ts"]), float(s["kwh"])),
-        )
-        if cur.rowcount == 0:
+        seq, ts_val, kwh = int(s["seq"]), float(s["ts"]), float(s["kwh"])
+        exists = conn.execute(
+            "SELECT 1 FROM meter_samples WHERE session_id=? AND seq=?", (sid, seq)).fetchone()
+        if exists:
+            # 重发幂等：无论会话现在什么状态，已入库的重复样本都按去重处理
             status, reason = "duplicate", "重复上报，已去重"
-        elif end_ts is not None and float(s["ts"]) > end_ts:
-            status, reason = "late", "晚于结束时间，不计入本次账单"
         else:
-            status, reason = "accepted", None
-        results.append({"seq": int(s["seq"]), "ts": float(s["ts"]),
-                        "status": status, "reason": reason})
-    if samples:
-        latest = max(float(s["kwh"]) for s in samples)
+            status, reason = classify(ts_val)
+            if status in ("accepted", "late"):
+                conn.execute(
+                    "INSERT OR IGNORE INTO meter_samples(session_id, seq, ts, kwh)"
+                    " VALUES(?,?,?,?)", (sid, seq, ts_val, kwh))
+        results.append({"seq": seq, "ts": ts_val, "status": status, "reason": reason})
+    stored = [r for r in results if r["status"] in ("accepted", "late")]
+    if stored:
+        latest = max(float(s["kwh"]) for s in samples
+                     if int(s["seq"]) in {r["seq"] for r in stored})
         conn.execute("UPDATE piles SET meter_kwh=MAX(meter_kwh, ?) WHERE pile_id=?", (latest, pile_id))
 
     # ---- 余额监管：已产生费用 + 下一间隔预估 >= 余额 则下令断电 ----
     warning, cmd = None, None
-    if sess and sess["state"] == "CHARGING" and sess["owner_id"]:
+    if (sess and sess["pile_id"] == pile_id
+            and sess["state"] == "CHARGING" and sess["owner_id"]):
         owner = conn.execute("SELECT * FROM owners WHERE owner_id=?",
                              (sess["owner_id"],)).fetchone()
         all_samples = [row_dict(r) for r in conn.execute(
@@ -482,7 +507,7 @@ def meter_report(pile_id):
                 warning = msg
     conn.commit()
     conn.close()
-    counts = {"accepted": 0, "duplicate": 0, "late": 0}
+    counts = {"accepted": 0, "duplicate": 0, "late": 0, "rejected": 0}
     for r in results:
         counts[r["status"]] += 1
     return jsonify({"ok": True,

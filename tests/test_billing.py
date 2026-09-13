@@ -288,7 +288,7 @@ class TestMeterClassification(unittest.TestCase):
         r = self._send([{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0},
                         {"seq": 2, "ts": self.t0 + 600, "kwh": 1010.0}])
         self.assertEqual([x["status"] for x in r["results"]], ["accepted", "accepted"])
-        self.assertEqual(r["summary"], {"accepted": 2, "duplicate": 0, "late": 0})
+        self.assertEqual(r["summary"], {"accepted": 2, "duplicate": 0, "late": 0, "rejected": 0})
         # 重发 -> duplicate（兼容字段也在）
         r = self._send([{"seq": 2, "ts": self.t0 + 600, "kwh": 1010.0}])
         self.assertEqual(r["results"][0]["status"], "duplicate")
@@ -385,6 +385,89 @@ class TestStationTariff(unittest.TestCase):
         r = self.client.post("/api/stations/S1/tariff", json={
             "periods": [["00:00", "12:00", "谷", 0.3]], "service_fee": 0.45})
         self.assertEqual(r.status_code, 400)
+
+
+class TestMeterValidation(unittest.TestCase):
+    """表码上报的会话校验：不存在 / 不属于本桩 / 已终结 一律拒收。"""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        server.DB_PATH = self.db
+        server.init_db()
+        self.client = server.app.test_client()
+        self.client.post("/api/piles/register", json={"pile_id": "P1"})
+        self.client.post("/api/piles/register", json={"pile_id": "P2"})
+        self.t0 = ts("2026-09-10 22:30")
+        self.sid = self.client.post("/api/piles/P1/event", json={
+            "type": "plug_in", "ts": self.t0, "meter_kwh": 1000.0
+        }).get_json()["session"]["session_id"]
+        self.client.post("/api/piles/P1/scan", json={"ts": self.t0})
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _send(self, pile, sid, samples):
+        return self.client.post(f"/api/piles/{pile}/meter",
+                                json={"session_id": sid, "samples": samples}).get_json()
+
+    def _stored(self, sid):
+        # 直接查库确认样本是否落库
+        conn = server.db()
+        n = conn.execute("SELECT COUNT(*) c FROM meter_samples WHERE session_id=?",
+                         (sid,)).fetchone()["c"]
+        conn.close()
+        return n
+
+    def test_unknown_session_rejected(self):
+        r = self._send("P1", "S不存在的会话", [{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0}])
+        self.assertEqual(r["results"][0]["status"], "rejected")
+        self.assertIn("不存在", r["results"][0]["reason"])
+        self.assertEqual(self._stored("S不存在的会话"), 0)   # 拒收不落库
+
+    def test_wrong_pile_rejected(self):
+        # P2 冒用 P1 的会话号上报
+        r = self._send("P2", self.sid, [{"seq": 1, "ts": self.t0 + 300, "kwh": 1500.0}])
+        self.assertEqual(r["results"][0]["status"], "rejected")
+        self.assertIn("不属于本桩", r["results"][0]["reason"])
+        self.assertEqual(self._stored(self.sid), 0)
+        # 本桩正常上报不受影响
+        r = self._send("P1", self.sid, [{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0}])
+        self.assertEqual(r["results"][0]["status"], "accepted")
+
+    def test_settled_session_rejected_but_retransmit_deduped(self):
+        self._send("P1", self.sid, [{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0}])
+        end = self.t0 + 300
+        self.client.post(f"/api/sessions/{self.sid}/stop", json={"ts": end})
+        self.client.post(f"/api/sessions/{self.sid}/settle", json={"ts": end})
+        # 已结算：新样本拒收
+        r = self._send("P1", self.sid, [{"seq": 2, "ts": self.t0 + 200, "kwh": 1003.0}])
+        self.assertEqual(r["results"][0]["status"], "rejected")
+        self.assertIn("已终结", r["results"][0]["reason"])
+        self.assertEqual(self._stored(self.sid), 1)
+        # 但结算后重发老样本仍按去重处理（幂等，不报错误拒绝）
+        r = self._send("P1", self.sid, [{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0}])
+        self.assertEqual(r["results"][0]["status"], "duplicate")
+
+    def test_late_backfill_after_finish_still_accepted(self):
+        end = self.t0 + 600
+        self._send("P1", self.sid, [{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0},
+                                    {"seq": 2, "ts": end, "kwh": 1010.0}])
+        self.client.post(f"/api/sessions/{self.sid}/stop", json={"ts": end})
+        # FINISHED 状态下窗口内补报仍接受
+        r = self._send("P1", self.sid, [{"seq": 3, "ts": self.t0 + 450, "kwh": 1007.5}])
+        self.assertEqual(r["results"][0]["status"], "accepted")
+        # 窗口外的只存档不计费
+        r = self._send("P1", self.sid, [{"seq": 4, "ts": end + 300, "kwh": 1015.0}])
+        self.assertEqual(r["results"][0]["status"], "late")
+
+    def test_plugged_session_rejected(self):
+        sid2 = self.client.post("/api/piles/P2/event", json={
+            "type": "plug_in", "ts": self.t0, "meter_kwh": 2000.0
+        }).get_json()["session"]["session_id"]
+        r = self._send("P2", sid2, [{"seq": 1, "ts": self.t0 + 300, "kwh": 2005.0}])
+        self.assertEqual(r["results"][0]["status"], "rejected")
+        self.assertIn("未开始充电", r["results"][0]["reason"])
 
 
 if __name__ == "__main__":
