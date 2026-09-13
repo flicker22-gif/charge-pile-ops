@@ -61,11 +61,14 @@ class Pile:
         return self._post(f"/api/piles/{self.pile_id}/event", {"type": "plug_out", "ts": ts})
 
     def report_meter(self, ts):
-        """生成一条电表样本；离线时缓存，上线后随 flush 一起补报。"""
+        """生成一条电表样本并尝试上报；离线时缓存，上线后随 flush 补报。
+
+        返回服务端响应（含 warning 预警 / cmd 断电指令），离线时返回 None。
+        """
         self.seq += 1
         sample = {"seq": self.seq, "ts": ts, "kwh": round(self.meter_kwh, 3)}
         self.buffer.append(sample)
-        self.flush()
+        return self.flush()
 
     def flush(self):
         """把缓存样本发出去；发送失败（仍离线）则保留缓存等下次。"""
@@ -98,4 +101,4 @@ class Pile:
 
     def reconnect(self):
         self.online = True
-        self.flush()
+        return self.flush()

@@ -1,25 +1,26 @@
 # 充电站运营系统（演示版）
 
-桩接进来上报状态，车主扫码充电，按 **插枪 → 充电中 → 结束 → 结算** 走完整流程；
-计费支持峰谷分时，跨时段按实际占比分开算；桩中途掉线不丢电，同一次充电不会重复结算。
+桩接进来上报状态，车主扫码充电，按 **插枪 → 充电中 → 结束 → 结算 → 拔枪离场** 走完整流程；
+峰谷分时计费，跨时段按实际占比分开算；预付费余额监管，余额不够提前断电；
+结算后占位计时收费；桩掉线不丢电，同一次充电不会重复结算。
 
 ## 结构
 
 ```
 server/
-  app.py       # Flask + SQLite 后端：桩接入、充电流程、计费、结算
+  app.py       # Flask + SQLite 后端：桩接入、充电流程、计费、余额监管、占位费、结算
   tariff.py    # 峰谷平费率表 + 跨时段拆分（运营方直接改 PERIODS / SERVICE_FEE）
 simulator/
-  pile_sim.py  # 充电桩模拟器：状态/表码上报，断线缓存、恢复补报
-demo.py        # 端到端演示：一辆车从扫码到出账单
+  pile_sim.py  # 充电桩模拟器：状态/表码上报，断线缓存、恢复补报，执行断电指令
+demo.py        # 端到端演示：预付费充电 → 余额断电 → 占位费 → 拔枪出账
 tests/
-  test_billing.py  # 拆分、补报去重、结算幂等的单元测试
+  test_billing.py  # 拆分、补报去重、结算幂等、余额断电、占位费的单元测试
 ```
 
 ## 运行
 
 ```bash
-python3 demo.py                          # 一键演示（自动起服务端，约 10 秒看完一整夜充电）
+python3 demo.py                          # 一键演示（自动起服务端，约 10 秒看完一整夜）
 python3 server/app.py --port 5000        # 单独起服务端
 python3 -m unittest discover -s tests    # 跑测试
 ```
@@ -32,35 +33,51 @@ python3 -m unittest discover -s tests    # 跑测试
 样本之间的时间段调用 `tariff.split_by_period` 按费率边界切开，该段电量按各时段
 时长占比分摊，再分别乘该时段电价 + 服务费。跨零点、跨多个时段都按实际占比算。
 
+**预付费断电**：车主先充值（余额按分存储）。充电中每次表码上报时，服务端核算
+已产生费用（按分时账单同一套逻辑）：达到余额 70% 发预警通知；
+已产生费用 + 下一上报间隔预估 ≥ 余额时，在响应里下发 `cmd: STOP` 断电指令，
+桩执行断电并提示车主，按实际充电量结算。预警和断电通知都落库（每会话每类一次），
+车主端可查。扫码时不带 `owner_id` 则按访客充电，不做余额监管。
+
+**占位费**：结算（SETTLED）即开始占位计时，拔枪（CLOSED）才截止。超出免费宽限的
+部分按分钟计费并入同一张账单，从余额扣款。宽限分钟数和费率是运营配置，
+`POST /api/config` 随时改。已结算未拔枪时 `GET /api/sessions/<id>` 返回
+`occupancy_running`，车主端能看到占位费实时在跑。
+
 **掉线不丢电**：表码是单调递增的累计值。桩断线时样本缓存在本地（`Pile.buffer`），
 恢复后批量补报；即使中间报文全丢，末次表码减起始底数仍是全部电量。
 
 **结算窗口**：结算只计入 `ts <= end_ts` 的样本——结束前产生、只是晚到的补报照常
-入账；结束之后才产生的样本（例如断线桩的滞后报文）不影响本单。结算时按窗口内
-样本重新定格 `end_meter`，保证会话表码与账单一致。
+入账；结束之后才产生的样本（如断线桩的滞后报文）不影响本单。
 
 **不重复计**：
 - 电表样本按 `(session_id, seq)` 唯一约束去重，补报/网络重发直接 `INSERT OR IGNORE`；
 - 结算按 `bills.session_id` 唯一约束保证一次充电只有一张账单，重复结算返回原账单
   （`duplicated: true`），并发下靠 `BEGIN IMMEDIATE` + 唯一索引兜底；
-- 插枪、扫码同样是幂等的，重复调用返回已存在的会话。
+- 插枪、扫码、拔枪同样是幂等的，重复调用返回已存在的会话/结果。
 
 ## 主要接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/api/owners/<id>/recharge` | 车主充值/开户 `{amount}` |
+| GET  | `/api/owners/<id>` | 余额 + 通知（预警/断电） |
+| GET/POST | `/api/config` | 运营配置：占位宽限、费率、预警比例 |
 | POST | `/api/piles/register` | 桩注册/上线 |
-| POST | `/api/piles/<id>/event` | `plug_in` 插枪建会话 / `plug_out` 拔枪 |
-| POST | `/api/piles/<id>/scan` | 车主扫码，PLUGGED → CHARGING |
-| POST | `/api/piles/<id>/meter` | 表码上报 `{session_id, samples:[{seq,ts,kwh}]}` |
-| POST | `/api/sessions/<id>/stop` | 结束充电，CHARGING → FINISHED |
-| POST | `/api/sessions/<id>/settle` | 结算出账单（幂等） |
-| GET  | `/api/sessions/<id>` | 会话 + 账单 |
+| POST | `/api/piles/<id>/event` | `plug_in` 插枪建会话 / `plug_out` 拔枪关单 |
+| POST | `/api/piles/<id>/scan` | 车主扫码（可带 `owner_id`），PLUGGED → CHARGING |
+| POST | `/api/piles/<id>/meter` | 表码上报；响应带 `warning`/`cmd` 监管指令 |
+| POST | `/api/sessions/<id>/stop` | 结束充电（`reason`: user / balance_insufficient） |
+| POST | `/api/sessions/<id>/settle` | 结算出账单（幂等），开始占位计时 |
+| GET  | `/api/sessions/<id>` | 会话 + 账单 + 实时占位费 |
 | GET  | `/api/piles` · `/api/tariff` | 桩列表 · 费率表 |
 
 ## 后续可扩展
 
 - 费率表目前写在 `tariff.py`，可挪到数据库按站配置；
 - 桩与服务端之间现在是简单 HTTP，可换成 OCPP 1.6/2.0.1（接口语义已对齐：
-  累计表码、带序号样本、幂等事务）；
-- 结算后接支付/发票；账单金额用分存储避免浮点（当前结算时才转 Decimal 舍入到分）。
+  累计表码、带序号样本、远程停机指令、幂等事务）；
+- 断电目前是"上报时下发指令"的半双工模式，桩长时间离线会延迟断电，
+  生产上应加服务端主动下推（WebSocket/OCPP）；
+- 占位费在余额不足时会产生欠费（余额可为负），可接追缴/限制再充流程；
+- 结算后接支付/发票。

@@ -27,6 +27,16 @@ def price_of(label):
     return _PRICE_BY_LABEL[label]
 
 
+def period_at(ts):
+    """某一时刻（epoch 秒）所在的费率时段名。"""
+    dt = datetime.fromtimestamp(ts)
+    minutes = dt.hour * 60 + dt.minute + dt.second / 60.0
+    for start_s, end_s, label, _price in PERIODS:
+        if _to_minutes(start_s) <= minutes < _to_minutes(end_s):
+            return label
+    raise ValueError(f"费率表未覆盖时刻 {dt}，请检查 PERIODS 是否覆盖全天")
+
+
 def _to_minutes(hhmm):
     h, m = hhmm.split(":")
     return int(h) * 60 + int(m)
