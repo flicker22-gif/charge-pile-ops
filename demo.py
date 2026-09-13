@@ -61,9 +61,16 @@ def main():
                 time.sleep(0.1)
 
         tariff = api("/api/tariff")
-        log("=== 费率表（电费 元/kWh，服务费 %.2f）===" % tariff["service_fee"])
+        log("=== 默认费率表（电费 元/kWh，服务费 %.2f）===" % tariff["service_fee"])
         for s, e, label, price in tariff["periods"]:
             log(f"  {s}-{e}  {label}  {price:.2f}")
+
+        log("\n=== 场站 ST01 自定义费率（谷时 0.30 元，比默认便宜）===")
+        st01_periods = [[s, e, l, (0.30 if l == "谷" else p)] for s, e, l, p in tariff["periods"]]
+        post("/api/stations/ST01/tariff", {
+            "periods": st01_periods, "service_fee": 0.45,
+            "effective_ts": datetime(2026, 9, 10, 0, 0).timestamp()})
+        log("  已发布，立即生效（POST /api/stations/ST01/tariff，不用改代码）")
 
         log("\n=== 运营方配置占位费规则（POST /api/config 可随时调整）===")
         post("/api/config", {"occupancy_free_minutes": 10, "occupancy_fee_per_min": 1.0})
@@ -77,6 +84,7 @@ def main():
 
         pile = Pile(SERVER, "CP001", "1号桩")
         pile.register()
+        post("/api/piles/register", {"pile_id": "CP001", "name": "1号桩", "station_id": "ST01"})
         t = datetime(2026, 9, 10, 22, 30)   # 虚拟时钟：平时段插枪，23:00 起进入谷时
 
         log(f"\n=== {t:%m-%d %H:%M} 车辆到站，插枪 ===")
@@ -92,18 +100,28 @@ def main():
         end_t = datetime(2026, 9, 11, 7, 30)
         offline_from = datetime(2026, 9, 10, 23, 40)
         offline_to = datetime(2026, 9, 10, 23, 50)
+        price_change_at = datetime(2026, 9, 10, 23, 30)
         log(f"\n=== 充电中，{POWER_KW:.0f}kW，每 {STEP_MIN} 分钟上报一次表码 ===")
         cmd = None
         while t < end_t:
             t += timedelta(minutes=STEP_MIN)
             pile.charge(STEP_KWH)
+            if t == price_change_at:
+                new_periods = [[s, e, l, (0.50 if l == "谷" else p)] for s, e, l, p in st01_periods]
+                post("/api/stations/ST01/tariff", {
+                    "periods": new_periods, "service_fee": 0.45,
+                    "effective_ts": t.timestamp()})
+                log(f"  {t:%H:%M}  💹 运营方调价：ST01 谷时 0.30 -> 0.50 元，立即生效；"
+                    f"本次充电跨过调价点，前后两段各按各的价")
             if t == offline_from:
                 pile.disconnect()
                 log(f"  {t:%H:%M}  ⚠ 桩断线，样本转本地缓存")
             resp = pile.report_meter(t.timestamp())
             if t == offline_to:
                 resp = pile.reconnect()
-                log(f"  {t:%H:%M}  ✓ 网络恢复，缓存样本已批量补报（断线期间的电量未丢失）")
+                s = resp["summary"]
+                log(f"  {t:%H:%M}  ✓ 网络恢复，缓存样本批量补报 -> "
+                    f"接受 {s['accepted']} 条，重复 {s['duplicate']} 条，晚于结束 {s['late']} 条")
             if resp and resp.get("warning"):
                 log(f"  {t:%H:%M}  ⚠ 服务端预警 -> {resp['warning']}")
             if t.strftime("%H:%M") in ("23:00", "07:00"):
@@ -120,7 +138,9 @@ def main():
 
         log("\n=== 模拟网络重传：最近一批样本原样重发 ===")
         r = pile.resend_last()
-        log(f"服务端响应：接受 {r['accepted']} 条，去重 {r['duplicated']} 条（重发不重复计）")
+        s = r["summary"]
+        log(f"服务端分类：接受 {s['accepted']}，重复 {s['duplicate']}，晚于结束 {s['late']}"
+            f"（seq {r['results'][0]['seq']} -> {r['results'][0]['status']}，重发不重复计）")
 
         log(f"\n=== {t:%m-%d %H:%M} 充电结束（原因：{cmd['reason'] if cmd else 'user'}）===")
         r = post(f"/api/sessions/{sid}/stop",
@@ -129,21 +149,32 @@ def main():
 
         log("\n=== 结束后又晚到一条表码（+5 kWh，模拟断线桩的滞后报文）===")
         pile.charge(STEP_KWH)
-        pile.report_meter((t + timedelta(minutes=STEP_MIN)).timestamp())
-        log("该样本产生于结束时间之后 -> 结算时将被排除，不会计入本单")
+        resp = pile.report_meter((t + timedelta(minutes=STEP_MIN)).timestamp())
+        r0 = resp["results"][0]
+        log(f"服务端分类：{r0['status']} -> {r0['reason']}")
 
         log("\n=== 结算（按实际充电量，从余额扣款）===")
         r = post(f"/api/sessions/{sid}/settle", {"ts": t.timestamp()})
         bill = r["bill"]
         log(f"账单 {bill['bill_id']}  总电量 {bill['total_kwh']} kWh  充电费 ¥{bill['total_amount']}")
-        log("┌────────┬────────────┬──────────┬──────────┬──────────┐")
-        log("│ 时段   │ 电量(kWh)  │ 电费(元) │ 服务费   │ 小计(元) │")
-        log("├────────┼────────────┼──────────┼──────────┼──────────┤")
+        log("┌────────┬───────────┬────────────┬──────────┬──────────┬──────────┐")
+        log("│ 时段   │ 单价(元)  │ 电量(kWh)  │ 电费(元) │ 服务费   │ 小计(元) │")
+        log("├────────┼───────────┼────────────┼──────────┼──────────┼──────────┤")
         for it in bill["breakdown"]:
-            log(f"│ {it['period']}     │ {it['kwh']:>10.1f} │ {it['energy_fee']:>8} │ "
-                f"{it['service_fee']:>8} │ {it['subtotal']:>8} │")
-        log("└────────┴────────────┴──────────┴──────────┴──────────┘")
+            log(f"│ {it['period']}     │ {it['energy_price']:.2f}+{it['service_price']:.2f} │ "
+                f"{it['kwh']:>10.1f} │ {it['energy_fee']:>8} │ {it['service_fee']:>8} │ {it['subtotal']:>8} │")
+        log("└────────┴───────────┴────────────┴──────────┴──────────┴──────────┘")
+        log("（谷时段被调价点切成两行：23:30 前 0.30+0.45，23:30 后 0.50+0.45，各算各的）")
         log(f"扣款后账户余额 ¥{r.get('owner_balance')}（结束后晚到的 5 kWh 未计入）")
+
+        log("\n=== 账单冻结验证：结算后再调价，老账单不变 ===")
+        frozen = bill["total_amount"]
+        post("/api/stations/ST01/tariff", {
+            "periods": [[s, e, l, (0.99 if l == "谷" else p)] for s, e, l, p in st01_periods],
+            "service_fee": 0.45, "effective_ts": datetime(2026, 9, 12, 0, 0).timestamp()})
+        again = api(f"/api/sessions/{sid}")["bill"]["total_amount"]
+        log(f"  谷时又调到 0.99 元（次日生效），本单金额仍为 ¥{again}"
+            + (" ✓" if again == frozen else " ❌ 被调价影响！"))
 
         log("\n=== 重复结算测试（同一会话再结算一次）===")
         r2 = post(f"/api/sessions/{sid}/settle")

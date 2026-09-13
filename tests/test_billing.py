@@ -261,5 +261,131 @@ class TestBalanceAndOccupancy(unittest.TestCase):
         self.assertAlmostEqual(float(r["bill"]["total_amount"]), 6.00)  # 只有充电费
 
 
+class TestMeterClassification(unittest.TestCase):
+    """上报接口逐条分类：accepted / duplicate / late。"""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        server.DB_PATH = self.db
+        server.init_db()
+        self.client = server.app.test_client()
+        self.client.post("/api/piles/register", json={"pile_id": "P1"})
+        self.t0 = ts("2026-09-10 22:30")
+        self.sid = self.client.post("/api/piles/P1/event", json={
+            "type": "plug_in", "ts": self.t0, "meter_kwh": 1000.0
+        }).get_json()["session"]["session_id"]
+        self.client.post("/api/piles/P1/scan", json={"ts": self.t0})
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _send(self, samples):
+        return self.client.post("/api/piles/P1/meter",
+                                json={"session_id": self.sid, "samples": samples}).get_json()
+
+    def test_classification(self):
+        r = self._send([{"seq": 1, "ts": self.t0 + 300, "kwh": 1005.0},
+                        {"seq": 2, "ts": self.t0 + 600, "kwh": 1010.0}])
+        self.assertEqual([x["status"] for x in r["results"]], ["accepted", "accepted"])
+        self.assertEqual(r["summary"], {"accepted": 2, "duplicate": 0, "late": 0})
+        # 重发 -> duplicate（兼容字段也在）
+        r = self._send([{"seq": 2, "ts": self.t0 + 600, "kwh": 1010.0}])
+        self.assertEqual(r["results"][0]["status"], "duplicate")
+        self.assertEqual(r["duplicated"], 1)
+        # 结束后才产生的样本 -> late（只存档不计费）
+        end = self.t0 + 600
+        self.client.post(f"/api/sessions/{self.sid}/stop", json={"ts": end})
+        r = self._send([{"seq": 3, "ts": end + 300, "kwh": 1015.0}])
+        self.assertEqual(r["results"][0]["status"], "late")
+        self.assertIn("晚于结束时间", r["results"][0]["reason"])
+        self.assertEqual(r["late"], 1)
+        # 结束前产生、晚到的补报仍是 accepted
+        r = self._send([{"seq": 4, "ts": self.t0 + 450, "kwh": 1007.5}])
+        self.assertEqual(r["results"][0]["status"], "accepted")
+        # 账单不受 late 样本影响：窗口内 1000->1007.5->1010 = 10 度
+        bill = self.client.post(f"/api/sessions/{self.sid}/settle",
+                                json={"ts": end}).get_json()["bill"]
+        self.assertEqual(bill["total_kwh"], 10.0)
+
+
+class TestStationTariff(unittest.TestCase):
+    """场站自定义电价 + 版本化生效 + 历史账单冻结。"""
+
+    PERIODS_V1 = [["00:00", "07:00", "谷", 0.30], ["07:00", "08:00", "平", 0.75],
+                  ["08:00", "11:00", "峰", 1.20], ["11:00", "18:00", "平", 0.75],
+                  ["18:00", "21:00", "峰", 1.20], ["21:00", "23:00", "平", 0.75],
+                  ["23:00", "24:00", "谷", 0.30]]
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        server.DB_PATH = self.db
+        server.init_db()
+        self.client = server.app.test_client()
+        self.client.post("/api/piles/register",
+                         json={"pile_id": "P1", "station_id": "S1"})
+        self.t0 = ts("2026-09-10 22:30")
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _set_tariff(self, valley_price, eff_ts):
+        periods = [p[:] for p in self.PERIODS_V1]
+        for p in periods:
+            if p[2] == "谷":
+                p[3] = valley_price
+        return self.client.post("/api/stations/S1/tariff", json={
+            "periods": periods, "service_fee": 0.45, "effective_ts": eff_ts})
+
+    def _charge(self, start, hours, kwh_per_hour=60.0):
+        sid = self.client.post("/api/piles/P1/event", json={
+            "type": "plug_in", "ts": start, "meter_kwh": 1000.0
+        }).get_json()["session"]["session_id"]
+        self.client.post("/api/piles/P1/scan", json={"ts": start})
+        n = int(hours * 2)  # 每 30 分钟一条
+        samples = [{"seq": i + 1, "ts": start + (i + 1) * 1800,
+                    "kwh": 1000.0 + (i + 1) * kwh_per_hour / 2} for i in range(n)]
+        self.client.post("/api/piles/P1/meter", json={"session_id": sid, "samples": samples})
+        end = start + hours * 3600
+        self.client.post(f"/api/sessions/{sid}/stop", json={"ts": end})
+        return sid, end
+
+    def test_mid_session_price_change_splits_bill(self):
+        self._set_tariff(0.30, self.t0 - 3600)                # 谷 0.30
+        self._set_tariff(0.50, ts("2026-09-10 23:30"))        # 23:30 起谷 0.50
+        sid, end = self._charge(self.t0, 2)                   # 22:30 -> 00:30
+        bill = self.client.post(f"/api/sessions/{sid}/settle",
+                                json={"ts": end}).get_json()["bill"]
+        self.assertEqual(bill["total_kwh"], 120.0)
+        lines = {(i["period"], i["energy_price"]): i for i in bill["breakdown"]}
+        self.assertAlmostEqual(lines[("平", 0.75)]["kwh"], 30.0)
+        self.assertAlmostEqual(lines[("谷", 0.30)]["kwh"], 30.0)   # 23:30 前的谷
+        self.assertAlmostEqual(lines[("谷", 0.50)]["kwh"], 60.0)   # 23:30 后的谷
+        # 30×1.2 + 30×0.75 + 60×0.95 = 36 + 22.5 + 57
+        self.assertAlmostEqual(float(bill["total_amount"]), 115.50)
+
+    def test_bill_frozen_and_new_session_uses_new_price(self):
+        self._set_tariff(0.30, self.t0 - 3600)
+        sid, end = self._charge(self.t0, 1)                   # 22:30 -> 23:30
+        bill = self.client.post(f"/api/sessions/{sid}/settle",
+                                json={"ts": end}).get_json()["bill"]
+        self.assertAlmostEqual(float(bill["total_amount"]), 58.50)  # 36 + 30×0.75
+        # 结算后调价：00:30 起谷 0.99
+        self._set_tariff(0.99, ts("2026-09-11 00:30"))
+        again = self.client.get(f"/api/sessions/{sid}").get_json()["bill"]
+        self.assertEqual(again["total_amount"], bill["total_amount"])  # 老账单不变
+        # 新充电立即用新价：01:00 -> 01:30 谷 30 度 @0.99+0.45
+        sid2, end2 = self._charge(ts("2026-09-11 01:00"), 0.5)
+        bill2 = self.client.post(f"/api/sessions/{sid2}/settle",
+                                 json={"ts": end2}).get_json()["bill"]
+        self.assertAlmostEqual(float(bill2["total_amount"]), 30 * 1.44)
+
+    def test_invalid_periods_rejected(self):
+        r = self.client.post("/api/stations/S1/tariff", json={
+            "periods": [["00:00", "12:00", "谷", 0.3]], "service_fee": 0.45})
+        self.assertEqual(r.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

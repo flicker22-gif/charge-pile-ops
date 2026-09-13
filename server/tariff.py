@@ -1,13 +1,12 @@
-"""峰谷分时电价：费率配置 + 跨时段拆分。
+"""峰谷分时电价：费率配置 + 跨时段/跨调价拆分。
 
-把一段充电时间 [start_ts, end_ts] 按费率时段边界切开，
-每个时段占多少秒就分得多少比例的电量，保证跨时段充电
-（例如夜里谷时开始、早上平时结束）能按实际各占多少分开计费。
+电价按场站版本化：每个场站有一条"费率版本时间线"（effective_ts -> 费率表），
+把一段充电时间 [start_ts, end_ts] 先按版本生效时刻切开，再按各版本的
+时段表切开——一次充电跨过调价时刻时，前后两段各按自己那会儿的价算。
 """
 from datetime import datetime, timedelta
 
-# 费率时段表：(开始, 结束, 时段名, 电价 元/kWh)
-# 运营方可直接改这张表，时段按一天内时间划分，覆盖全天 24 小时即可。
+# 默认费率表：场站未配置时兜底用。(开始, 结束, 时段名, 电价 元/kWh)
 PERIODS = [
     ("00:00", "07:00", "谷", 0.35),
     ("07:00", "08:00", "平", 0.75),
@@ -18,23 +17,18 @@ PERIODS = [
     ("23:00", "24:00", "谷", 0.35),
 ]
 
-SERVICE_FEE = 0.45  # 服务费 元/kWh，各时段一致，可按站改
+SERVICE_FEE = 0.45  # 默认服务费 元/kWh
 
-_PRICE_BY_LABEL = {label: price for _, _, label, price in PERIODS}
+
+def price_in(periods, label):
+    for _, _, l, p in periods:
+        if l == label:
+            return p
+    raise KeyError(label)
 
 
 def price_of(label):
-    return _PRICE_BY_LABEL[label]
-
-
-def period_at(ts):
-    """某一时刻（epoch 秒）所在的费率时段名。"""
-    dt = datetime.fromtimestamp(ts)
-    minutes = dt.hour * 60 + dt.minute + dt.second / 60.0
-    for start_s, end_s, label, _price in PERIODS:
-        if _to_minutes(start_s) <= minutes < _to_minutes(end_s):
-            return label
-    raise ValueError(f"费率表未覆盖时刻 {dt}，请检查 PERIODS 是否覆盖全天")
+    return price_in(PERIODS, label)
 
 
 def _to_minutes(hhmm):
@@ -42,11 +36,31 @@ def _to_minutes(hhmm):
     return int(h) * 60 + int(m)
 
 
-def split_by_period(start_ts, end_ts):
-    """把 [start_ts, end_ts]（epoch 秒）按费率时段拆分。
+def validate_periods(periods):
+    """校验时段表无缝覆盖全天 00:00-24:00。返回错误信息或 None。"""
+    spans = sorted((_to_minutes(s), _to_minutes(e)) for s, e, _l, _p in periods)
+    if not spans or spans[0][0] != 0:
+        return "时段表必须从 00:00 开始"
+    for (s, e), (ns, _ne) in zip(spans, spans[1:]):
+        if e != ns:
+            return "时段表存在空隙或重叠"
+    if spans[-1][1] != 24 * 60:
+        return "时段表必须覆盖到 24:00"
+    return None
 
-    返回 {时段名: 秒数}，各时段秒数之和等于 end_ts - start_ts。
-    """
+
+def period_at(ts, periods=PERIODS):
+    """某一时刻（epoch 秒）所在的费率时段名。"""
+    dt = datetime.fromtimestamp(ts)
+    minutes = dt.hour * 60 + dt.minute + dt.second / 60.0
+    for start_s, end_s, label, _price in periods:
+        if _to_minutes(start_s) <= minutes < _to_minutes(end_s):
+            return label
+    raise ValueError(f"费率表未覆盖时刻 {dt}，请检查时段表是否覆盖全天")
+
+
+def split_by_periods(start_ts, end_ts, periods):
+    """把 [start_ts, end_ts]（epoch 秒）按给定时段表拆分，返回 {时段名: 秒数}。"""
     if end_ts <= start_ts:
         return {}
     result = {}
@@ -56,7 +70,7 @@ def split_by_period(start_ts, end_ts):
         dt = datetime.fromtimestamp(t)
         day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
         minutes = dt.hour * 60 + dt.minute + dt.second / 60.0 + dt.microsecond / 6e7
-        for start_s, end_s, label, _price in PERIODS:
+        for start_s, end_s, label, _price in periods:
             if _to_minutes(start_s) <= minutes < _to_minutes(end_s):
                 period_end = (day_start + timedelta(minutes=_to_minutes(end_s))).timestamp()
                 boundary = min(period_end, end_ts)
@@ -64,5 +78,42 @@ def split_by_period(start_ts, end_ts):
                 t = boundary
                 break
         else:
-            raise ValueError(f"费率表未覆盖时刻 {dt}，请检查 PERIODS 是否覆盖全天")
+            raise ValueError(f"费率表未覆盖时刻 {dt}，请检查时段表是否覆盖全天")
+    return result
+
+
+def split_by_period(start_ts, end_ts):
+    """按默认费率表拆分（兼容旧调用）。"""
+    return split_by_periods(start_ts, end_ts, PERIODS)
+
+
+def version_at(versions, ts):
+    """时间线上 ts 时刻生效的版本，返回 (periods, service_fee)。早于首版本用首版本。"""
+    periods, fee = versions[0][1], versions[0][2]
+    for eff, p, f in versions:
+        if eff <= ts:
+            periods, fee = p, f
+        else:
+            break
+    return periods, fee
+
+
+def split_by_timeline(start_ts, end_ts, versions):
+    """把 [start_ts, end_ts] 先按费率版本生效时刻切、再按各版本时段表切。
+
+    versions: [(effective_ts, periods, service_fee)]，按 effective_ts 升序。
+    返回 {(时段名, 电价, 服务费): 秒数}，按首次出现顺序排列——
+    同一时段名调价前后会是两个键，账单上自然分成两行。
+    """
+    if end_ts <= start_ts:
+        return {}
+    bounds = [start_ts]
+    bounds += sorted(e for e, _p, _f in versions if start_ts < e < end_ts)
+    bounds.append(end_ts)
+    result = {}
+    for a, b in zip(bounds, bounds[1:]):
+        periods, fee = version_at(versions, a)
+        for label, secs in split_by_periods(a, b, periods).items():
+            key = (label, price_in(periods, label), fee)
+            result[key] = result.get(key, 0.0) + secs
     return result

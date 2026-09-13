@@ -30,8 +30,15 @@ python3 -m unittest discover -s tests    # 跑测试
 ## 关键设计
 
 **分时计费**：桩按固定间隔上报电表**累计读数**（带时间戳）。结算时对每两个相邻
-样本之间的时间段调用 `tariff.split_by_period` 按费率边界切开，该段电量按各时段
-时长占比分摊，再分别乘该时段电价 + 服务费。跨零点、跨多个时段都按实际占比算。
+样本之间的时间段按费率边界切开，该段电量按各时段时长占比分摊，再分别乘该时段
+电价 + 服务费。跨零点、跨多个时段都按实际占比算。
+
+**电价按场站可配、版本化生效**：费率存在 `tariff_versions` 表（场站 + 生效时刻 →
+时段表 + 服务费），`POST /api/stations/<id>/tariff` 发布新版，不用改代码重发。
+计费时先把充电时间按调价生效时刻切开，再按各版本的时段表切——一次充电跨过
+调价时刻，前后两段各按当时的价格算（账单上同时段不同价会分成两行）。
+新版本立即对生效时刻之后的充电区间生效；已出账单金额落库冻结，不随后续调价变化。
+未配置的场站用 `tariff.py` 里的默认费率兜底。
 
 **预付费断电**：车主先充值（余额按分存储）。充电中每次表码上报时，服务端核算
 已产生费用（按分时账单同一套逻辑）：达到余额 70% 发预警通知；
@@ -46,6 +53,11 @@ python3 -m unittest discover -s tests    # 跑测试
 
 **掉线不丢电**：表码是单调递增的累计值。桩断线时样本缓存在本地（`Pile.buffer`），
 恢复后批量补报；即使中间报文全丢，末次表码减起始底数仍是全部电量。
+
+**上报逐条分类**：`/meter` 响应里 `results` 对每条样本给出状态——
+`accepted`（有效计入）/ `duplicate`（重复，已去重）/ `late`（晚于结束时间，
+只存档不计费），运营能直接看出补报里每条的去向；`summary` 是三类计数。
+分类只影响反馈，不改变存储和去重行为。
 
 **结算窗口**：结算只计入 `ts <= end_ts` 的样本——结束前产生、只是晚到的补报照常
 入账；结束之后才产生的样本（如断线桩的滞后报文）不影响本单。
@@ -63,10 +75,12 @@ python3 -m unittest discover -s tests    # 跑测试
 | POST | `/api/owners/<id>/recharge` | 车主充值/开户 `{amount}` |
 | GET  | `/api/owners/<id>` | 余额 + 通知（预警/断电） |
 | GET/POST | `/api/config` | 运营配置：占位宽限、费率、预警比例 |
-| POST | `/api/piles/register` | 桩注册/上线 |
+| POST | `/api/stations/<id>/tariff` | 发布场站费率版本（时段表+服务费+生效时刻） |
+| GET  | `/api/stations/<id>/tariff` | 查询场站当前（或指定时刻）生效的费率 |
+| POST | `/api/piles/register` | 桩注册/上线（可带 `station_id`） |
 | POST | `/api/piles/<id>/event` | `plug_in` 插枪建会话 / `plug_out` 拔枪关单 |
 | POST | `/api/piles/<id>/scan` | 车主扫码（可带 `owner_id`），PLUGGED → CHARGING |
-| POST | `/api/piles/<id>/meter` | 表码上报；响应带 `warning`/`cmd` 监管指令 |
+| POST | `/api/piles/<id>/meter` | 表码上报；响应含逐条分类 + `warning`/`cmd` 监管指令 |
 | POST | `/api/sessions/<id>/stop` | 结束充电（`reason`: user / balance_insufficient） |
 | POST | `/api/sessions/<id>/settle` | 结算出账单（幂等），开始占位计时 |
 | GET  | `/api/sessions/<id>` | 会话 + 账单 + 实时占位费 |
@@ -74,7 +88,6 @@ python3 -m unittest discover -s tests    # 跑测试
 
 ## 后续可扩展
 
-- 费率表目前写在 `tariff.py`，可挪到数据库按站配置；
 - 桩与服务端之间现在是简单 HTTP，可换成 OCPP 1.6/2.0.1（接口语义已对齐：
   累计表码、带序号样本、远程停机指令、幂等事务）；
 - 断电目前是"上报时下发指令"的半双工模式，桩长时间离线会延迟断电，

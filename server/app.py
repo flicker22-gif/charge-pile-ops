@@ -14,7 +14,8 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from flask import Flask, jsonify, request
 
-from tariff import PERIODS, SERVICE_FEE, period_at, price_of, split_by_period
+from tariff import (PERIODS, SERVICE_FEE, period_at, price_in, split_by_timeline,
+                    validate_periods, version_at)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charge_ops.db")
 
@@ -78,6 +79,15 @@ CREATE TABLE IF NOT EXISTS config (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tariff_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id   TEXT NOT NULL,
+    effective_ts REAL NOT NULL,     -- 生效时刻；同一时刻刻只保留一版
+    periods      TEXT NOT NULL,     -- JSON [[开始,结束,时段名,电价],...]
+    service_fee  TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    UNIQUE(station_id, effective_ts)
+);
 """
 
 # 运营方可通过 POST /api/config 调整
@@ -108,9 +118,11 @@ def init_db():
     conn.executescript(SCHEMA)
     # 兼容旧库文件：补新列
     for col, ddl in [("owner_id", "TEXT"), ("stop_reason", "TEXT"),
-                     ("occupancy_start_ts", "REAL"), ("plug_out_ts", "REAL")]:
+                     ("occupancy_start_ts", "REAL"), ("plug_out_ts", "REAL"),
+                     ("station_id", "TEXT")]:
         _ensure_column(conn, "sessions", col, ddl)
     _ensure_column(conn, "bills", "occupancy", "TEXT")
+    _ensure_column(conn, "piles", "station_id", "TEXT NOT NULL DEFAULT 'default'")
     for k, v in DEFAULT_CONFIG.items():
         conn.execute("INSERT OR IGNORE INTO config(key, value) VALUES(?,?)", (k, v))
     conn.commit()
@@ -140,6 +152,17 @@ def fen_to_yuan(fen):
 def get_cfg(conn, key):
     r = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
     return r["value"] if r else DEFAULT_CONFIG[key]
+
+
+def get_timeline(conn, station_id):
+    """场站的费率版本时间线 [(effective_ts, periods, service_fee)]，未配置用默认费率。"""
+    rows = conn.execute(
+        "SELECT effective_ts, periods, service_fee FROM tariff_versions"
+        " WHERE station_id=? ORDER BY effective_ts", (station_id or "default",)).fetchall()
+    if not rows:
+        return [(0.0, PERIODS, SERVICE_FEE)]
+    return [(r["effective_ts"], [tuple(p) for p in json.loads(r["periods"])],
+             float(r["service_fee"])) for r in rows]
 
 
 def notify_once(conn, owner_id, sid, ntype, message, ts):
@@ -228,15 +251,59 @@ def register_pile():
     pile_id = body.get("pile_id")
     if not pile_id:
         return err("pile_id required")
+    station_id = body.get("station_id", "default")
     conn = db()
     conn.execute(
-        "INSERT INTO piles(pile_id, name, status, last_seen) VALUES(?,?, 'online', ?) "
-        "ON CONFLICT(pile_id) DO UPDATE SET name=excluded.name, status='online', last_seen=excluded.last_seen",
-        (pile_id, body.get("name", ""), now()),
+        "INSERT INTO piles(pile_id, name, station_id, status, last_seen) VALUES(?,?,?, 'online', ?) "
+        "ON CONFLICT(pile_id) DO UPDATE SET name=excluded.name, station_id=excluded.station_id,"
+        " status='online', last_seen=excluded.last_seen",
+        (pile_id, body.get("name", ""), station_id, now()),
     )
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "pile_id": pile_id})
+    return jsonify({"ok": True, "pile_id": pile_id, "station_id": station_id})
+
+
+# ---------------- 场站费率（按场站配置，版本化生效） ----------------
+
+@app.post("/api/stations/<station_id>/tariff")
+def set_station_tariff(station_id):
+    """发布一版场站费率：{periods: [[开始,结束,时段名,电价]...], service_fee, effective_ts?}。
+
+    effective_ts 缺省为当前时刻（立即生效）。新版本只影响生效时刻之后的
+    充电区间：进行中的会话跨过调价时刻会分段计价，已出账单不受影响。
+    """
+    body = request.get_json(force=True)
+    periods = body.get("periods")
+    service_fee = body.get("service_fee")
+    if not periods or service_fee is None:
+        return err("periods 和 service_fee 必填")
+    bad = validate_periods(periods)
+    if bad:
+        return err(f"时段表不合法：{bad}")
+    eff = float(body.get("effective_ts") or now())
+    conn = db()
+    conn.execute(
+        "INSERT INTO tariff_versions(station_id, effective_ts, periods, service_fee, created_at)"
+        " VALUES(?,?,?,?,?) "
+        "ON CONFLICT(station_id, effective_ts) DO UPDATE SET periods=excluded.periods,"
+        " service_fee=excluded.service_fee, created_at=excluded.created_at",
+        (station_id, eff, json.dumps(periods, ensure_ascii=False), str(service_fee), now()))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "station_id": station_id, "effective_ts": eff})
+
+
+@app.get("/api/stations/<station_id>/tariff")
+def get_station_tariff(station_id):
+    """场站当前（或 ?ts= 指定时刻）生效的费率版本。"""
+    ts = float(request.args.get("ts") or now())
+    conn = db()
+    versions = get_timeline(conn, station_id)
+    conn.close()
+    periods, fee = version_at(versions, ts)
+    return jsonify({"ok": True, "station_id": station_id,
+                    "periods": periods, "service_fee": fee})
 
 
 @app.post("/api/piles/<pile_id>/event")
@@ -258,11 +325,12 @@ def pile_event(pile_id):
             conn.close()
             # 幂等：重复上报插枪返回已存在的会话
             return jsonify({"ok": True, "session": row_dict(sess), "duplicated": True})
+        pile = conn.execute("SELECT station_id FROM piles WHERE pile_id=?", (pile_id,)).fetchone()
         sid = "S" + uuid.uuid4().hex[:12]
         conn.execute(
-            "INSERT INTO sessions(session_id, pile_id, state, plug_ts, start_meter, created_at)"
-            " VALUES(?,?, 'PLUGGED', ?, ?, ?)",
-            (sid, pile_id, ts, meter, now()),
+            "INSERT INTO sessions(session_id, pile_id, station_id, state, plug_ts, start_meter, created_at)"
+            " VALUES(?,?,?, 'PLUGGED', ?, ?, ?)",
+            (sid, pile_id, (pile["station_id"] if pile else None) or "default", ts, meter, now()),
         )
         conn.commit()
         sess = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
@@ -363,31 +431,43 @@ def meter_report(pile_id):
     samples = body.get("samples") or []
     conn = db()
     conn.execute("UPDATE piles SET last_seen=?, status='online' WHERE pile_id=?", (now(), pile_id))
-    accepted = 0
+    sess = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
+    end_ts = sess["end_ts"] if sess else None
+
+    # 逐条分类：accepted 有效计入 / duplicate 重复去重 / late 晚于结束时间（只存档不计费）
+    results = []
     for s in samples:
         cur = conn.execute(
             "INSERT OR IGNORE INTO meter_samples(session_id, seq, ts, kwh) VALUES(?,?,?,?)",
             (sid, int(s["seq"]), float(s["ts"]), float(s["kwh"])),
         )
-        accepted += cur.rowcount
+        if cur.rowcount == 0:
+            status, reason = "duplicate", "重复上报，已去重"
+        elif end_ts is not None and float(s["ts"]) > end_ts:
+            status, reason = "late", "晚于结束时间，不计入本次账单"
+        else:
+            status, reason = "accepted", None
+        results.append({"seq": int(s["seq"]), "ts": float(s["ts"]),
+                        "status": status, "reason": reason})
     if samples:
         latest = max(float(s["kwh"]) for s in samples)
         conn.execute("UPDATE piles SET meter_kwh=MAX(meter_kwh, ?) WHERE pile_id=?", (latest, pile_id))
 
     # ---- 余额监管：已产生费用 + 下一间隔预估 >= 余额 则下令断电 ----
     warning, cmd = None, None
-    sess = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
     if sess and sess["state"] == "CHARGING" and sess["owner_id"]:
         owner = conn.execute("SELECT * FROM owners WHERE owner_id=?",
                              (sess["owner_id"],)).fetchone()
         all_samples = [row_dict(r) for r in conn.execute(
             "SELECT seq, ts, kwh FROM meter_samples WHERE session_id=? ORDER BY ts, seq", (sid,))]
         if owner and len(all_samples) >= 2:
-            _, accrued, _, _ = compute_bill(sess, all_samples)
+            versions = get_timeline(conn, sess["station_id"])
+            _, accrued, _, _ = compute_bill(sess, all_samples, versions)
             accrued_d = Decimal(accrued)
             balance_d = Decimal(owner["balance_fen"]) / 100
             last, prev = all_samples[-1], all_samples[-2]
-            price = Decimal(str(price_of(period_at(last["ts"])) + SERVICE_FEE))
+            periods, fee = version_at(versions, last["ts"])
+            price = Decimal(str(price_in(periods, period_at(last["ts"], periods)) + fee))
             est_next = Decimal(f"{last['kwh'] - prev['kwh']:.6f}") * price
             warn_ratio = Decimal(get_cfg(conn, "low_balance_warn_ratio"))
             if accrued_d + est_next >= balance_d:
@@ -402,8 +482,14 @@ def meter_report(pile_id):
                 warning = msg
     conn.commit()
     conn.close()
-    return jsonify({"ok": True, "accepted": accepted,
-                    "duplicated": len(samples) - accepted,
+    counts = {"accepted": 0, "duplicate": 0, "late": 0}
+    for r in results:
+        counts[r["status"]] += 1
+    return jsonify({"ok": True,
+                    "accepted": counts["accepted"],      # 兼容旧字段：有效计入条数
+                    "duplicated": counts["duplicate"],   # 兼容旧字段：重复去重条数
+                    "late": counts["late"],
+                    "summary": counts, "results": results,
                     "warning": warning, "cmd": cmd})
 
 
@@ -446,9 +532,11 @@ def stop(sid):
     return jsonify({"ok": True, "session": row_dict(sess)})
 
 
-def compute_bill(sess, samples):
+def compute_bill(sess, samples, versions):
     """按表码样本把电量切到各费率时段：每段样本区间的电量按时间占比分摊。
 
+    versions 是场站费率时间线：先按调价生效时刻切，再按各版本时段表切，
+    跨过调价时刻的充电前后两段各按当时的价格算。
     只计入 ts <= end_ts 的样本：结束前产生、只是晚到的补报照常算；
     结束之后才产生的样本不影响本次结算。
     """
@@ -457,34 +545,33 @@ def compute_bill(sess, samples):
         samples = [s for s in samples if s["ts"] <= end_ts]
     points = [(sess["start_ts"], sess["start_meter"])] + [(s["ts"], s["kwh"]) for s in samples]
     points.sort(key=lambda p: p[0])
-    kwh_by_label = {}
+    kwh_by_key = {}
     for (t0, e0), (t1, e1) in zip(points, points[1:]):
         delta = e1 - e0
         if delta <= 0 or t1 <= t0:
             continue
-        for label, secs in split_by_period(t0, t1).items():
-            kwh_by_label[label] = kwh_by_label.get(label, 0.0) + delta * secs / (t1 - t0)
+        for key, secs in split_by_timeline(t0, t1, versions).items():
+            kwh_by_key[key] = kwh_by_key.get(key, 0.0) + delta * secs / (t1 - t0)
 
     total_kwh = points[-1][1] - points[0][1]
     items, total = [], Decimal("0")
-    for label in ("峰", "平", "谷"):
-        kwh = kwh_by_label.get(label, 0.0)
+    for (label, energy_price, service_fee), kwh in kwh_by_key.items():
         if kwh <= 0:
             continue
-        energy_fee = (Decimal(f"{kwh:.6f}") * Decimal(str(price_of(label)))).quantize(
+        energy_fee = (Decimal(f"{kwh:.6f}") * Decimal(str(energy_price))).quantize(
             Decimal("0.01"), ROUND_HALF_UP)
-        service_fee = (Decimal(f"{kwh:.6f}") * Decimal(str(SERVICE_FEE))).quantize(
+        service_fee_amt = (Decimal(f"{kwh:.6f}") * Decimal(str(service_fee))).quantize(
             Decimal("0.01"), ROUND_HALF_UP)
         items.append({
             "period": label,
             "kwh": round(kwh, 3),
-            "energy_price": price_of(label),
-            "service_price": SERVICE_FEE,
+            "energy_price": energy_price,
+            "service_price": service_fee,
             "energy_fee": str(energy_fee),
-            "service_fee": str(service_fee),
-            "subtotal": str(energy_fee + service_fee),
+            "service_fee": str(service_fee_amt),
+            "subtotal": str(energy_fee + service_fee_amt),
         })
-        total += energy_fee + service_fee
+        total += energy_fee + service_fee_amt
     return round(total_kwh, 3), str(total), items, points[-1][1]
 
 
@@ -514,7 +601,8 @@ def _settle(conn, sess, ts):
         return existing, True
     samples = [row_dict(r) for r in conn.execute(
         "SELECT seq, ts, kwh FROM meter_samples WHERE session_id=? ORDER BY ts, seq", (sid,))]
-    total_kwh, total_amount, items, final_meter = compute_bill(sess, samples)
+    versions = get_timeline(conn, sess["station_id"])
+    total_kwh, total_amount, items, final_meter = compute_bill(sess, samples, versions)
     # 晚到的窗口内补报可能把末次表码推高，结算时按窗口内样本重新定格
     bill_id = "B" + uuid.uuid4().hex[:12]
     conn.execute(
@@ -608,7 +696,12 @@ def get_session(sid):
 
 @app.get("/api/tariff")
 def get_tariff():
-    return jsonify({"ok": True, "periods": PERIODS, "service_fee": SERVICE_FEE})
+    """默认场站当前生效的费率（兼容旧调用）。"""
+    conn = db()
+    versions = get_timeline(conn, "default")
+    conn.close()
+    periods, fee = version_at(versions, now())
+    return jsonify({"ok": True, "periods": periods, "service_fee": fee})
 
 
 @app.get("/api/health")
